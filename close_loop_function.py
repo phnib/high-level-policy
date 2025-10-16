@@ -187,7 +187,8 @@ class ClosedLoopController:
                         pass
                 else:
                     # Not complete yet; keep polling within the same phase
-                    print(f"[HL] Phase {self.current_task_id} not complete yet. Continue polling...")
+                    print(self.send_llp_command(self.current_task_id))
+                    print(f"[HL] Phase {self.current_task_id} not complete, send the complete command.")
 
         except KeyboardInterrupt:
             print("\n[HL] Interrupted by user. Shutting down gracefully.")
@@ -204,7 +205,7 @@ if __name__ == "__main__":
     # Minimal inline config; replace or extend with your own config source.
     cfg = {
         # ResNet checker can ignore or use this; kept for backward compatibility
-        "vlm_api": None,
+        "vlm_api": 'http://10.162.34.47:8888',
 
         # ROS image reader / publisher settings
         "ros_node_name": "image_reader_closed_loop",
