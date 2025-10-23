@@ -13,9 +13,10 @@ from ros_command_publisher import InstructorCommandPublisher
 
 class ClosedLoopController:
     """Closed-loop high-level controller with ROS (no human verification).
+
     Cycle: 1->2->3->4->5->(wrap)->1 ...
-    After publishing phase 5's command, check task 6 (finish gate).
-    If finished, optionally publish "6_finished" and exit.
+    After TASK 1 is verified complete, capture a fresh image and check TASK 6 (finish gate).
+    If finished, optionally publish "6_finished" and exit; otherwise continue the cycle.
     """
 
     def __init__(self, cfg: Dict[str, Any]) -> None:
@@ -48,9 +49,9 @@ class ClosedLoopController:
         subscribe_psm2  = bool(cfg.get("subscribe_psm2", False))
         subscribe_seg   = bool(cfg.get("subscribe_seg", False))
 
-        self.frame_timeout     = float(cfg.get("frame_timeout_sec", 5.0))
-        self.save_dir          = cfg.get("ros_frame_save_dir", "./")  # always use ./
-        self.poll_interval_sec = float(cfg.get("poll_interval_sec", 1.0))
+        self.frame_timeout       = float(cfg.get("frame_timeout_sec", 5.0))
+        self.save_dir            = cfg.get("ros_frame_save_dir", "./")  # always use ./
+        self.poll_interval_sec   = float(cfg.get("poll_interval_sec", 1.0))
 
         self.reader = ROSImageReader(
             node_name=cfg.get("ros_node_name", "image_reader_closed_loop"),
@@ -70,22 +71,20 @@ class ClosedLoopController:
     # ---------- Core IO helpers ----------
 
     def get_current_obs(self) -> str:
-        """Grab the latest left endoscope frame and persist it as './dvrk_left.jpg'. Returns that path."""
+        """Grab latest left endoscope frame and persist it as './dvrk_left.jpg'. Returns that path."""
         got = self.reader.wait_for("left", timeout_sec=self.frame_timeout)
         if got is None:
             raise TimeoutError(
                 f"No image received from /jhu_daVinci/left/image_raw within {self.frame_timeout} seconds."
             )
 
-        # Save using the reader (likely a timestamped path), then copy/overwrite to fixed filename.
+        # Reader saves to a temp path; copy/overwrite to fixed filename and delete the temp.
         temp_path  = self.reader.save("left", save_dir=self.save_dir)
         fixed_path = os.path.join(self.save_dir or "./", "dvrk_left.jpg")
 
         try:
-            # Overwrite fixed path with the latest image
             if os.path.abspath(temp_path) != os.path.abspath(fixed_path):
                 shutil.copyfile(temp_path, fixed_path)
-                # Remove the temp file so that only dvrk_left.jpg remains on disk
                 try:
                     os.remove(temp_path)
                 except Exception as e_rm:
@@ -94,8 +93,6 @@ class ClosedLoopController:
             return fixed_path
         except Exception as e:
             print(f"[HL] Failed to write fixed image '{fixed_path}' from '{temp_path}': {repr(e)}")
-            # As a last resort, still try to use the temp_path (but this violates 'only dvrk_left.jpg')
-            # Prefer to re-raise to avoid leaving stray files; caller can retry next tick.
             raise
 
     def _task_id_to_command_str(self, task_id: int) -> str:
@@ -116,7 +113,7 @@ class ClosedLoopController:
     # ---------- Finish gate (task 6) ----------
 
     def _check_finish_gate_with_image(self, img_path: str) -> bool:
-        """Return True if task 6 is finished according to the API checker. Also print the API result."""
+        """Return True if task 6 is finished according to the API checker, and print the API result."""
         try:
             pred = check_task_complete(
                 image_path=img_path,
@@ -134,11 +131,11 @@ class ClosedLoopController:
     def run(self) -> None:
         """
         - Publish command for task 1.
-        - Each tick: capture image -> check current task. Print API result each time.
-          If complete: advance and publish next command.
-          After publishing phase 5's command (including re-sends), capture a fresh image and check task 6.
-          If task 6 is finished, optionally publish "6_finished" and EXIT.
-          Otherwise continue cycling 1..5.
+        - Each tick: capture image -> check CURRENT TASK and print API result.
+          If task is complete, advance and (if moving from 1->2) check FINISH GATE (task 6) first:
+              - Capture a fresh image and check 6; if finished, optionally publish "6_finished" and EXIT.
+              - Otherwise publish the next task's command and continue.
+          Wrap 5->1 and repeat.
         """
         try:
             # Publish the very first command (task 1)
@@ -147,14 +144,14 @@ class ClosedLoopController:
             while True:
                 time.sleep(self.poll_interval_sec)
 
-                # Capture one image per tick for checking current task
+                # Capture latest image for checking current task
                 try:
                     img_path = self.get_current_obs()
                 except Exception as e:
                     print(f"[HL] Failed to capture ROS image at task_id={self.current_task_id}: {repr(e)}")
                     continue
 
-                # Evaluate current task (1..5) and PRINT the API result
+                # Evaluate current task and PRINT the API result
                 try:
                     is_complete = check_task_complete(
                         image_path=img_path,
@@ -164,54 +161,42 @@ class ClosedLoopController:
                     print(f"[API] task {self.current_task_id} complete? {bool(is_complete)}")
                 except Exception as e:
                     print(f"[HL] check_task_complete error at task_id={self.current_task_id}: {repr(e)}")
-                    # Re-publish current command to keep LLP engaged
+                    # Keep LLP engaged
                     print(self.send_llp_command(self.current_task_id))
                     print("[HL] Re-sent current command due to verification error.")
                     continue
 
                 if is_complete:
-                    # Advance to next phase
+                    # We're advancing to the next phase
+                    prev_task = self.current_task_id
                     self.current_task_id += 1
 
-                    if self.current_task_id <= self.last_phase_id:
-                        # Publish the next phase (2..5)
-                        print(self.send_llp_command(self.current_task_id))
-
-                        # If we just published phase 5, check finish gate now
-                        if self.current_task_id == self.last_phase_id:
-                            try:
-                                finish_img = self.get_current_obs()
-                            except Exception as e:
-                                print(f"[HL] Failed to capture image for finish gate: {repr(e)}")
-                                continue
-
+                    # If we just completed TASK 1, check finish gate BEFORE publishing task 2
+                    if prev_task == 1:
+                        try:
+                            finish_img = self.get_current_obs()
+                        except Exception as e:
+                            print(f"[HL] Failed to capture image for finish gate (after task 1): {repr(e)}")
+                            # If we can't capture, proceed to task 2 anyway
+                        else:
                             if self._check_finish_gate_with_image(finish_img):
                                 if self.send_final_on_exit:
                                     print(self.send_llp_command(self.final_done_id))  # "6_finished"
-                                print("[HL] Finish gate confirmed after publishing phase 5. Exiting.")
-                                break
+                                print("[HL] Finish gate confirmed after completing task 1. Exiting.")
+                                return  # exit run()
+
+                    # Normal publishing of next command or wrap
+                    if self.current_task_id <= self.last_phase_id:
+                        print(self.send_llp_command(self.current_task_id))
                     else:
-                        # Completed phase 5 previously; wrap back to phase 1 and publish it
+                        # Completed phase 5 previously -> wrap back to phase 1 and publish it
                         self.current_task_id = self.first_phase_id
                         print(self.send_llp_command(self.current_task_id))
+
                 else:
                     # Not complete -> resend current phase command
                     print(self.send_llp_command(self.current_task_id))
                     print(f"[HL] Phase {self.current_task_id} not complete; re-sent current command.")
-
-                    # If we are (re-)publishing phase 5, also check finish gate after the resend
-                    if self.current_task_id == self.last_phase_id:
-                        try:
-                            finish_img = self.get_current_obs()
-                        except Exception as e:
-                            print(f"[HL] Failed to capture image for finish gate (resend path): {repr(e)}")
-                            continue
-
-                        if self._check_finish_gate_with_image(finish_img):
-                            if self.send_final_on_exit:
-                                print(self.send_llp_command(self.final_done_id))  # "6_finished"
-                            print("[HL] Finish gate confirmed after re-publishing phase 5. Exiting.")
-                            break
 
         except KeyboardInterrupt:
             print("\n[HL] Interrupted by user. Shutting down gracefully.")
@@ -225,8 +210,8 @@ class ClosedLoopController:
 # ---------- Entry point with CLI arg for poll interval ----------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Closed-loop ROS controller (no human verification)")
-    parser.add_argument("--poll-interval-sec", type=float, default=10.0,
+    parser = argparse.ArgumentParser(description="Closed-loop ROS controller (finish check after task 1 complete)")
+    parser.add_argument("--poll-interval-sec", type=float, default=40.0,
                         help="Polling interval in seconds (loop cadence).")
     args = parser.parse_args()
 
